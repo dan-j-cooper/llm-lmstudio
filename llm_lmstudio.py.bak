@@ -1,0 +1,318 @@
+import os
+import platform
+from typing import Any, Iterator, Mapping, Optional
+from collections import defaultdict
+
+import httpx
+import llm
+import orjson
+from pydantic import Field
+
+# try:
+#     __version__ = metadata.version("lmstudio")
+# except metadata.PackageNotFoundError:
+#     __version__ = "0.0.1"
+
+
+@llm.hookimpl
+def register_models(register):
+    register(_LMStudio())
+
+
+class LMStudioClient:
+    def __init__(
+        self,
+        client: httpx.Client,
+        host: str,
+        *,
+        timeout: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
+        **kwargs,
+    ):
+        headers = {
+            k.lower(): v
+            for k, v in {
+                **(headers or {}),
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"lmstudio-python/{__version__} ({platform.machine()} {platform.system().lower()}) Python/{platform.python_version()}",
+            }.items()
+            if v is not None
+        }
+        self.headers = headers
+        self.host = host
+
+    def stream_response(self) -> Iterator[str]:
+        stream_response(self.host, self.client)
+
+
+def stream_response(
+    c: httpx.Client,
+    addr: str,
+    request: dict[str, Any],
+    headers: Optional[dict[str, str]] = None,
+) -> Iterator[str]:
+    if not headers:
+        headers = {"Content-Type": "application/json"}
+    with c.stream(
+        "POST",
+        url=f"{addr}/v1/chat/completions",
+        content=orjson.dumps(request),
+        headers=headers,
+        timeout=None,
+    ) as response:
+        response.raise_for_status()
+        for block in response.iter_raw():
+            if block[6:12] == b"[DONE]":
+                break
+            js = orjson.loads(block[6:])["choices"][0]["delta"]
+            if content := js.get("content"):
+                yield content
+
+def _parse_auth_from_env() -> tuple[str | None]:
+    """Parse OLLAMA_HOST environment variable and extract credentials."""
+    host = os.getenv("LMSTUDIO_HOST")
+    auth = None
+    if host is not None:
+        host, auth = _parse_auth_from_url(host)
+    return host, auth
+
+
+def _create_client(client_class: Type[T]):
+    """Create a client with host, authentication, and headers set based on environment variables."""
+    host = 
+    kwargs: ClientParams = {
+        "timeout": httpx.Timeout(DEFAULT_REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT),
+        "headers": _parse_headers_from_env(),
+    }
+    if host is not None:
+        kwargs["host"] = host
+    if auth is not None:
+        kwargs["auth"] = auth
+    return client_class(**kwargs)
+
+
+def get_response(
+    c: httpx.Client,
+    addr: str,
+    request: dict[str, Any],
+    headers: Optional[dict[str, str]] = None,
+) -> str:
+    if not headers:
+        headers = {"Content-Type": "application/json"}
+    response = c.post(
+        url=f"{addr}/v1/chat/completions",
+        content=orjson.dumps(request),
+        headers={"Content-Type": "application/json"},
+        timeout=None,
+    )
+    return response.json()["choices"][0]
+
+
+@llm.hookimpl
+def register_embedding_models(register):
+    models = defaultdict(list)
+    for model in _get_ollama_models():
+        models[model["digest"]].append(model["model"])
+        if model["model"].endswith(":latest"):
+            models[model["digest"]].append(model["model"][: -len(":latest")])
+    for names in models.values():
+        name, aliases = _pick_primary_name(names)
+        register(OllamaEmbed(name), aliases=aliases)
+
+class _LMStudio(llm.Model):
+    model_id = ""
+    can_stream = True
+    supports_schema = True
+    supports_tools = True
+
+    attachment_types = {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+    }
+
+    class Options(llm.Options):
+        """Parameters that can be set when the model is run by Ollama.
+
+        See: https://github.com/ollama/ollama/blob/main/docs/modelfile.md#parameter
+        """
+
+        num_ctx: Optional[int] = Field(
+            default=None,
+            description="Sets the size of the context window used to generate the next token.",
+        )
+        repeat_penalty: Optional[float] = Field(
+            default=None,
+            description="Sets how strongly to penalize repetitions. A higher value (e.g., 1.5) will penalize repetitions more strongly, while a lower value (e.g., 0.9) will be more lenient. (Default: 1.1)",
+        )
+        temperature: Optional[float] = Field(
+            default=None,
+            description="The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)",
+        )
+        num_predict: Optional[int] = Field(
+            default=None,
+            description="Maximum number of tokens to predict when generating text. (Default: -1, infinite generation)",
+        )
+        top_k: Optional[int] = Field(
+            default=None,
+            description="Reduces the probability of generating nonsense. A higher value (e.g. 100) will give more diverse answers, while a lower value (e.g. 10) will be more conservative. (Default: 40)",
+        )
+        top_p: Optional[float] = Field(
+            default=None,
+            description="Works together with top-k. A higher value (e.g., 0.95) will lead to more diverse text, while a lower value (e.g., 0.5) will generate more focused and conservative text. (Default: 0.9)",
+        )
+        min_p: Optional[float] = Field(
+            default=None,
+            description="Alternative to the top_p, and aims to ensure a balance of quality and variety. The parameter p represents the minimum probability for a token to be considered, relative to the probability of the most likely token. (Default: 0.0)",
+        )
+        json_object: Optional[bool] = Field(
+            default=None,
+            description="Output a valid JSON object {...}. Prompt must mention JSON.",
+        )
+        think: Optional[bool] = Field(
+            default=None,
+            description="Enable the model's thinking process.",
+        )
+
+    def __init__(
+        self,
+        prompt: llm.Prompt,
+        stream: bool,
+        response: llm.Response,
+        model_id: str,
+        conversation=None,
+        supports_tools: bool = True,
+    ) -> None:
+        self.model_id = model_id
+        self.supports_tools = supports_tools
+
+        messages = self.build_messages(prompt, conversation)
+        response._prompt_json = {"messages": messages}
+        options = prompt.options.model_dump(exclude_none=True)
+        think = options.pop("think", None)
+        json_object = options.pop("json_object", None)
+        kwargs = {}
+        usage = None
+        if think is not None:
+            kwargs["think"] = think
+        if json_object:
+            kwargs["format"] = "json"
+        elif prompt.schema:
+            kwargs["format"] = prompt.schema
+        if prompt.tools:
+            kwargs["tools"] = [
+                tool.implementation for tool in prompt.tools if tool.implementation
+            ]
+        if stream:
+            response_stream = self._client.chat(
+                model=self.model_id,
+                messages=messages,
+                stream=True,
+                options=options,
+                **kwargs,
+            )
+            for chunk in response_stream:
+                if chunk.message.tool_calls:
+                    for tool_call in chunk.message.tool_calls:
+                        response.add_tool_call(
+                            llm.ToolCall(
+                                name=tool_call.function.name,
+                                arguments=tool_call.function.arguments,
+                            )
+                        )
+                    if chunk.get("done", None):
+                        usage = {
+                            "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                            "completion_tokens": chunk("eval_count", 0),
+                        }
+                    yield chunk.get("message", {}).get("content", {})
+        else:
+            ollama_response = get_client().chat(
+                model=self.model_id,
+                messages=messages,
+                options=options,
+                **kwargs,
+            )
+            response.response_json = ollama_response.dict()
+            usage = {
+                "prompt_tokens": response.response_json["prompt_eval_count"],
+                "completion_tokens": response.response_json["eval_count"],
+            }
+            yield response.response_json["message"]["content"]
+            if ollama_response.message.tool_calls:
+                for tool_call in ollama_response.message.tool_calls:
+                    response.add_tool_call(
+                        llm.ToolCall(
+                            name=tool_call.function.name,
+                            arguments=tool_call.function.arguments,
+                        )
+                    )
+        self.set_usage(response, usage)
+
+    def __str__(self) -> str:
+        return f"LMstudio: {self.model_id}"
+
+    def build_messages(
+        self, prompt: llm.Prompt, conversation: Optional[llm.Conversation]
+    ) -> list[dict[str, str]]:
+        messages = []
+        if not conversation:
+            if prompt.system:
+                messages.append({"role": "system", "content": prompt.system})
+            messages.append({"role": "user", "content": prompt.prompt})
+            if prompt.attachments:
+                messages[-1]["images"] = [
+                    attachment.base64_content() for attachment in prompt.attachments
+                ]
+            return messages
+
+        current_system = None
+        for prev_response in conversation.responses:
+            if (
+                prev_response.prompt.system
+                and prev_response.prompt.system != current_system
+            ):
+                messages.append(
+                    {"role": "system", "content": prev_response.prompt.system},
+                )
+                current_system = prev_response.prompt.system
+            messages.append({"role": "user", "content": prev_response.prompt.prompt})
+            if prev_response.prompt.attachments:
+                messages[-1]["images"] = [
+                    attachment.base64_content()
+                    for attachment in prev_response.prompt.attachments
+                ]
+
+            messages.append(
+                {"role": "assistant", "content": prev_response.text_or_raise()}
+            )
+        if prompt.system and prompt.system != current_system:
+            messages.append({"role": "system", "content": prompt.system})
+        messages.append({"role": "user", "content": prompt.prompt})
+        if prompt.attachments:
+            messages[-1]["images"] = [
+                attachment.base64_content() for attachment in prompt.attachments
+            ]
+        for tool_result in prompt.tool_results:
+            messages.append(
+                {
+                    "role": "tool",
+                    "content": tool_result.output,
+                    "name": tool_result.name,
+                }
+            )
+
+        return messages
+
+    def execute(
+        self,
+        prompt: llm.Prompt,
+        stream: bool,
+        response: llm.Response,
+        conversation: Optional[llm.Conversation],
+    ) -> Iterator[str]:
+        messages = self.build_messages(prompt, conversation)
+        if not stream:
+            pass
